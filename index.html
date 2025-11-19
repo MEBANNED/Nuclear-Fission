@@ -1,0 +1,608 @@
+<!DOCTYPE HTML>
+<html lang="en-US">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nuclear Fission Chain Reaction (Three.js)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000000; font-family: 'Comic Sans MS', sans-serif; }
+        canvas { display: block; }
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background-color: #4F46E5; /* Indigo */
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 12px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        button:hover {
+            background-color: #6366F1;
+            box-shadow: 0 6px 8px rgba(0, 0, 0, 0.3);
+            transform: translateY(-1px);
+        }
+        button:active {
+            background-color: #4338CA;
+            transform: translateY(1px);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: #ffffff;
+            background-color: rgba(0, 0, 0, 0.6);
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <button id="startButton">Start Reaction</button>
+    </div>
+    <div id="info">
+        <p>Atoms Fissioned: <span id="fissionCount">0</span></p>
+        <p>Neutrons in Motion: <span id="neutronCount">0</span></p>
+    </div>
+
+    <!-- Three.js CDN --><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Orbit Controls for better camera movement --><script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <!-- GSAP CDN for smooth explosion effects --><script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.9.1/gsap.min.js"></script>
+
+
+    <script>
+        // --- CONSTANTS AND GLOBAL SETUP ---
+        const NEUTRON_COUNT_RELEASED = 2; // Confirmed at 2 per user request
+        const FISSION_PRODUCT_VELOCITY = 0.5;
+        // Adjusted neutron velocity for criticality
+        const NEUTRON_VELOCITY = 0.3; 
+        // NEW: Much faster initial speed to guarantee an instant visual strike
+        const INITIAL_LAUNCH_VELOCITY = 20.0; 
+        
+        const ATOM_GRID_SIZE = 6; 
+        const URANIUM_RADIUS = 3.0; 
+        // Adjusted spacing for higher criticality
+        const SPACING = URANIUM_RADIUS * 2.05; 
+        const BOUNDARY = (ATOM_GRID_SIZE / 2) * SPACING * 1.5;
+
+        // Increased speed multiplier for main particles (neutrons, fission products)
+        const SIMULATION_SPEED_MULTIPLIER = 25; 
+
+        // CRITICAL FIX: Increased collision margin to prevent fast-moving neutrons from "tunneling" through atoms.
+        const COLLISION_MARGIN = 4.0; 
+
+        // New constant for random neutron loss (simulating general absorption or leakage)
+        // This is the "now and then" disappearance requested by the user.
+        const RANDOM_ABSORPTION_CHANCE_PER_FRAME = 0.005; // 0.5% chance per frame for a neutron to disappear
+
+        // Simulation control variables
+        let reactionStartTime = null;
+        let currentFissionLimit = 0; // This variable now holds the random limit (125-175) for the current run
+        const TIME_LIMIT_SECONDS = 7;
+        let isReactionOver = false;
+
+        // --- CORE THREE.JS SETUP ---
+        
+        if (THREE.Vector3.prototype.randomDirection === undefined) {
+            THREE.Vector3.prototype.randomDirection = function () {
+                var phi = Math.random() * 2 * Math.PI;
+                var theta = Math.acos(Math.random() * 2 - 1);
+                
+                var x = Math.sin(theta) * Math.cos(phi);
+                var y = Math.sin(theta) * Math.sin(phi);
+                var z = Math.cos(theta);
+
+                this.set(x, y, z).normalize();
+                return this;
+            };
+        }
+
+        let scene, camera, renderer, controls;
+        let atoms = [];
+        let particles = [];
+        let explosionParticles = []; 
+        let stats = {
+            fissionCount: 0,
+            neutronCount: 0
+        };
+
+        const materials = {
+            uranium: new THREE.MeshPhongMaterial({ color: 0x6EE7B7, emissive: 0x00FF00, emissiveIntensity: 0.7, transparent: true, opacity: 1.0, shininess: 80 }), 
+            neutron: new THREE.MeshPhongMaterial({ color: 0x93C5FD, emissive: 0x00FFFF, emissiveIntensity: 1.0, shininess: 90 }), 
+            strontium: new THREE.MeshPhongMaterial({ color: 0xFF7F50, emissive: 0xFF4500, emissiveIntensity: 0.5, shininess: 50 }), 
+            xenon: new THREE.MeshPhongMaterial({ color: 0xFFD700, emissive: 0xFFD700, emissiveIntensity: 0.5, shininess: 50 }), 
+            explosionParticle: new THREE.MeshBasicMaterial({ color: 0xFF4500, transparent: true, opacity: 1, blending: THREE.AdditiveBlending }), 
+        };
+
+        // --- PARTICLE CLASSES ---
+
+        class UraniumAtom {
+            constructor(x, y, z) {
+                this.isFissile = true;
+                this.radius = URANIUM_RADIUS;
+                this.mesh = new THREE.Mesh(new THREE.SphereGeometry(this.radius, 16, 16), materials.uranium.clone());
+                this.mesh.position.set(x, y, z);
+                scene.add(this.mesh);
+            }
+
+            destroy() {
+                this.isFissile = false;
+                scene.remove(this.mesh);
+                this.mesh.geometry.dispose();
+                this.mesh.material.dispose();
+            }
+        }
+
+        class MovingParticle {
+            constructor(type, position, velocity, radius, material) {
+                this.type = type; 
+                this.velocity = new THREE.Vector3().copy(velocity);
+                this.radius = radius;
+                this.mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 8), material.clone());
+                this.mesh.position.copy(position);
+                scene.add(this.mesh);
+            }
+
+            update(deltaTime) {
+                // deltaTime is already scaled by SIMULATION_SPEED_MULTIPLIER
+                this.mesh.position.addScaledVector(this.velocity, deltaTime);
+
+                // *** RANDOM ABSORPTION/LOSS LOGIC (The "now and then" disappearance) ***
+                if (this.type === 'neutron' && Math.random() < RANDOM_ABSORPTION_CHANCE_PER_FRAME) {
+                    this.destroy(); 
+                    return; 
+                }
+
+                // Boundary check (standard leakage)
+                if (this.mesh.position.length() > BOUNDARY * 1.5) {
+                    this.destroy();
+                    // Explicitly stop processing after destruction due to leakage
+                    return; 
+                }
+            }
+
+            destroy() {
+                const index = particles.indexOf(this);
+                if (index > -1) {
+                    particles.splice(index, 1);
+                }
+                scene.remove(this.mesh);
+                this.mesh.geometry.dispose();
+                this.mesh.material.dispose();
+
+                if (this.type === 'neutron') {
+                    stats.neutronCount--;
+                }
+            }
+        }
+
+        // New class for short-lived explosion fragments (The Fireball components)
+        class ExplosionParticle {
+            constructor(position, color, size, speed) {
+                // Slightly larger base geometry for a fuller look (increased size * 1.0)
+                this.mesh = new THREE.Mesh(new THREE.SphereGeometry(size * 1.0, 8, 8), materials.explosionParticle.clone()); 
+                this.mesh.position.copy(position);
+                this.mesh.material.color.set(color);
+                scene.add(this.mesh);
+
+                this.velocity = new THREE.Vector3().randomDirection().multiplyScalar(speed * (0.8 + Math.random()));
+                this.life = 0; 
+                // MaxLife for sustained, lingering effect (0.3 to 0.8 seconds)
+                this.maxLife = 0.3 + Math.random() * 0.5; 
+
+                // GSAP animation for fading and scaling
+                gsap.to(this.mesh.material, { opacity: 0, duration: this.maxLife, ease: "power1.out" });
+                gsap.to(this.mesh.scale, { x: 0.01, y: 0.01, z: 0.01, duration: this.maxLife, ease: "power1.out" }); // Fade scale
+            }
+
+            update(deltaTime) {
+                // Explosion movement is kept at factor 10 to maintain visual speed consistency
+                this.mesh.position.addScaledVector(this.velocity, deltaTime * 10); 
+                this.life += deltaTime;
+                return this.life >= this.maxLife; // Return true if particle is dead
+            }
+
+            destroy() {
+                scene.remove(this.mesh);
+                this.mesh.geometry.dispose();
+                this.mesh.material.dispose();
+            }
+        }
+
+        function createFuelCore() {
+            for (let i = 0; i < ATOM_GRID_SIZE; i++) {
+                for (let j = 0; j < ATOM_GRID_SIZE; j++) {
+                    for (let k = 0; k < ATOM_GRID_SIZE; k++) {
+                        const x = (i - ATOM_GRID_SIZE / 2 + 0.5) * SPACING;
+                        const y = (j - ATOM_GRID_SIZE / 2 + 0.5) * SPACING;
+                        const z = (k - ATOM_GRID_SIZE / 2 + 0.5) * SPACING;
+                        atoms.push(new UraniumAtom(x, y, z));
+                    }
+                }
+            }
+        }
+
+        function performFission(atom, neutron) {
+            // Do not perform new fissions if the reaction is over
+            if (isReactionOver) return; 
+
+            stats.fissionCount++;
+            
+            // Check against the randomly set fission limit for the current run
+            if (stats.fissionCount >= currentFissionLimit) {
+                isReactionOver = true;
+            }
+
+            const fissionPosition = atom.mesh.position.clone();
+
+            atom.destroy();
+            neutron.destroy();
+
+            // *** Enhanced Explosion Effect (Fireball style) ***
+            // Increased density up to 200 particles
+            const numExplosionParticles = 150 + Math.floor(Math.random() * 50); 
+            for (let i = 0; i < numExplosionParticles; i++) {
+                // HSL color range focused on yellow, orange, and red (Hue: 0.0 to 0.1)
+                const hue = Math.random() * 0.1; // 0.0 (red) to 0.1 (orange/yellow)
+                const saturation = 0.8 + Math.random() * 0.2; // High saturation
+                const lightness = 0.6 + Math.random() * 0.4; // High lightness for glow
+                const color = new THREE.Color().setHSL(hue, saturation, lightness); 
+                const size = 0.4 + Math.random() * 0.4; // Larger initial size
+                const speed = 2 + Math.random() * 3; // Base speed for movement
+                explosionParticles.push(new ExplosionParticle(fissionPosition.clone(), color, size, speed));
+            }
+
+            // Fission products still fly apart randomly
+            const baseDir = new THREE.Vector3().randomDirection().normalize();
+            const productDir1 = baseDir.clone().multiplyScalar(FISSION_PRODUCT_VELOCITY);
+            const productDir2 = baseDir.clone().negate().multiplyScalar(FISSION_PRODUCT_VELOCITY * 0.8);
+
+            particles.push(new MovingParticle('fission_product', fissionPosition.clone(), productDir1, 0.6, materials.strontium));
+            particles.push(new MovingParticle('fission_product', fissionPosition.clone(), productDir2, 0.9, materials.xenon));
+
+            // NEW LOGIC: Calculate direction vector pointing towards the origin (center of the fuel core)
+            const centerDirection = new THREE.Vector3()
+                .copy(fissionPosition)
+                .negate()
+                .normalize();
+
+            for (let i = 0; i < NEUTRON_COUNT_RELEASED; i++) {
+                // Apply a slight random scattering/perturbation to the center-seeking direction.
+                // Reduced scatter to 0.1 for much stronger inward focus and higher criticality.
+                const scatter = new THREE.Vector3().randomDirection().multiplyScalar(0.1); 
+                const finalDirection = centerDirection.clone().add(scatter).normalize();
+                
+                // Use the standard NEUTRON_VELOCITY for subsequent fissions
+                const neutronDir = finalDirection.multiplyScalar(NEUTRON_VELOCITY); 
+                particles.push(new MovingParticle('neutron', fissionPosition.clone(), neutronDir, 0.3, materials.neutron));
+                stats.neutronCount++;
+            }
+        }
+
+        // --- SIMULATION LOGIC ---
+
+        function checkCollisions() {
+            // Only check collisions if the reaction is not over
+            if (isReactionOver) return; 
+
+            const remainingAtoms = atoms.filter(a => a.isFissile);
+            const neutrons = particles.filter(p => p.type === 'neutron');
+            const fissions = [];
+
+            for (const neutron of neutrons) {
+                if (particles.indexOf(neutron) === -1) continue; 
+                
+                for (let i = remainingAtoms.length - 1; i >= 0; i--) {
+                    const atom = remainingAtoms[i];
+                    const distance = neutron.mesh.position.distanceTo(atom.mesh.position);
+
+                    // Use the increased COLLISION_MARGIN to prevent tunneling
+                    if (distance < atom.radius + neutron.radius + COLLISION_MARGIN) {
+                        fissions.push({ atom, neutron });
+                        break; 
+                    }
+                }
+            }
+            fissions.forEach(({ atom, neutron }) => performFission(atom, neutron));
+        }
+
+        // --- INITIALIZATION AND ANIMATION LOOP ---
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.Fog(0x000000, BOUNDARY * 0.5, BOUNDARY * 1.2);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            // Adjusted camera position to be closer to the atom grid for better visibility
+            camera.position.z = BOUNDARY * 1.2; 
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Added stronger ambient light to compensate for the removed dynamic point lights
+            scene.add(new THREE.AmbientLight(0x666666)); 
+            
+            const mainLight = new THREE.PointLight(0xffffff, 2.5, 0); 
+            mainLight.position.set(0, 0, BOUNDARY * 0.8);
+            scene.add(mainLight);
+            
+            const secondLight = new THREE.PointLight(0xffffff, 1.5, 0); 
+            secondLight.position.set(0, BOUNDARY * 0.5, -BOUNDARY * 0.5);
+            scene.add(secondLight);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = false;
+            controls.minDistance = 30;
+            controls.maxDistance = BOUNDARY * 3; 
+
+            resetSimulation();
+
+            document.getElementById('startButton').addEventListener('click', startReaction);
+            // Removed the redundant resetButton listener
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function resetSimulation() {
+            atoms.forEach(a => a.destroy());
+            particles.forEach(p => p.destroy());
+            explosionParticles.forEach(ep => ep.destroy()); 
+
+            atoms = [];
+            particles = [];
+            explosionParticles = []; 
+            stats.fissionCount = 0;
+            stats.neutronCount = 0;
+
+            reactionStartTime = null; // Reset the timer
+            isReactionOver = false;  // Reset the state
+
+            // Set random fission limit between 125 and 175
+            const minLimit = 125;
+            const maxLimit = 175;
+            currentFissionLimit = Math.floor(Math.random() * (maxLimit - minLimit + 1)) + minLimit; 
+
+            createFuelCore();
+            updateInfoDisplay();
+            
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('startButton').innerText = 'Start Reaction';
+        }
+
+        // Helper function to force-remove all remaining neutrons and reset the counter
+        function cleanupFrozenNeutrons() {
+            let removedCount = 0;
+            // Iterate backwards to safely destroy all remaining 'neutron' particles.
+            for (let i = particles.length - 1; i >= 0; i--) {
+                if (particles[i].type === 'neutron') {
+                    // Calling destroy() handles removal from the scene and particles array
+                    particles[i].destroy(); 
+                    removedCount++;
+                }
+            }
+            
+            // Ensure the counter is truly zero after cleanup, compensating for any potential missed decrements.
+            if (stats.neutronCount !== 0) {
+                 console.warn(`[Cleanup] Correcting neutron count from ${stats.neutronCount} to 0. Removed ${removedCount} lingering particles.`);
+            } else {
+                 console.log(`[Cleanup] Successfully removed ${removedCount} lingering neutron particles.`);
+            }
+            
+            stats.neutronCount = 0; 
+            // CRITICAL FIX: Update the display element directly and immediately for an instant visual 0.
+            document.getElementById('neutronCount').innerText = 0; 
+        }
+
+        function startReaction() {
+            const startButton = document.getElementById('startButton');
+
+            // If the reaction is over or depleted, clicking 'Start' button triggers a reset
+            if (stats.fissionCount > 0 && stats.neutronCount === 0 || isReactionOver) {
+                resetSimulation();
+                return; 
+            }
+
+            // Only start if no neutrons are currently in motion
+            if (stats.neutronCount > 0) return; 
+
+            const remainingFissileAtoms = atoms.filter(a => a.isFissile);
+            if (remainingFissileAtoms.length === 0) return;
+
+            // --- Logic: Target all but 2-5 atoms in every Z-Row (plane) ---
+            
+            const MIN_SURVIVORS_PER_ROW = 2;
+            const MAX_SURVIVORS_PER_ROW = 5;
+
+            let targets = [];
+            let destructionPlan = []; // For logging to prove uniform destruction
+
+            // 1. Group atoms by Z-coordinate (row)
+            const atomsByZ = remainingFissileAtoms.reduce((acc, atom) => {
+                // Use fixed decimal to reliably group atoms in the same plane
+                const z = atom.mesh.position.z.toFixed(2); 
+                if (!acc[z]) acc[z] = [];
+                acc[z].push(atom);
+                return acc;
+            }, {});
+
+            // 2. Iterate through each row (Z-plane) and select survivors/targets
+            // This loop ensures every row is treated equally.
+            const zKeys = Object.keys(atomsByZ).sort(); // Sort keys for clearer console output
+            
+            for (const z of zKeys) {
+                const rowAtoms = atomsByZ[z];
+                // Shuffle the row atoms
+                const shuffledRow = [...rowAtoms].sort(() => 0.5 - Math.random());
+                
+                // Determine the number of survivors (2 to 5)
+                const numSurvivors = Math.floor(Math.random() * (MAX_SURVIVORS_PER_ROW - MIN_SURVIVORS_PER_ROW + 1)) + MIN_SURVIVORS_PER_ROW; 
+
+                // All atoms *after* the first 'numSurvivors' in the shuffled list are targets for destruction
+                const rowTargets = shuffledRow.slice(numSurvivors); 
+
+                targets.push(...rowTargets);
+                
+                // Log the plan for this row
+                destructionPlan.push({
+                    z: parseFloat(z),
+                    totalAtoms: rowAtoms.length,
+                    survivors: numSurvivors,
+                    targets: rowTargets.length
+                });
+            }
+
+            // --- Logging for Transparency ---
+            console.log("--- INITIAL DESTRUCTION PLAN ---");
+            console.log(`Total Atoms to be Targeted: ${targets.length}`);
+            console.table(destructionPlan.map(p => ({
+                'Z-Position': p.z,
+                'Total': p.totalAtoms,
+                'Targets': p.targets,
+                'Survivors': p.survivors
+            })));
+            console.log("----------------------------------");
+            // --- End Logging ---
+
+            // 3. Launch one neutron directly at every target atom for instant fission.
+            
+            // Start the reaction timer
+            reactionStartTime = performance.now();
+            isReactionOver = false;
+
+            for (const targetAtom of targets) {
+                const atomPos = targetAtom.mesh.position;
+                
+                // Determine a random approach vector (from where the neutron will come)
+                const approachVector = new THREE.Vector3().randomDirection(); 
+
+                // Calculate the starting position (just outside the collision margin for guaranteed strike)
+                // URANIUM_RADIUS 3.0 + Neutron_Radius 0.3 + 0.1 epsilon = 3.4
+                const launchDistance = URANIUM_RADIUS + 0.3 + 0.1; 
+                // Set start position on the atom's surface + a small margin, in the direction of the approach vector
+                const startPosition = atomPos.clone().addScaledVector(approachVector, launchDistance);
+
+                // Calculate the velocity (directed exactly towards the atom center)
+                const velocity = approachVector.negate().multiplyScalar(INITIAL_LAUNCH_VELOCITY);
+
+                particles.push(new MovingParticle('neutron', startPosition, velocity, 0.3, materials.neutron));
+                stats.neutronCount++; 
+            }
+
+            // --- END NEW LOGIC ---
+
+            startButton.disabled = true;
+            startButton.innerText = 'Reaction In Progress...';
+        }
+
+        let clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const deltaTime = clock.getDelta();
+            controls.update();
+            
+            // --- PARTICLE UPDATE LOGIC ---
+
+            // Only update non-fission products (neutrons) and check for collisions if the reaction is NOT over.
+            if (!isReactionOver) {
+                // Particle speed multiplier for faster chain reaction spread.
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    particles[i].update(deltaTime * SIMULATION_SPEED_MULTIPLIER); 
+                }
+                checkCollisions();
+            } else {
+                // If the reaction is over, only allow existing fission products to continue moving/fading out.
+                // Neutrons (type 'neutron') were cleaned up by cleanupFrozenNeutrons()
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    if (particles[i].type === 'fission_product') {
+                        particles[i].update(deltaTime * SIMULATION_SPEED_MULTIPLIER);
+                    }
+                }
+            }
+
+
+            // Update and clean up explosion particles (Fireball fade-out effect always runs)
+            for (let i = explosionParticles.length - 1; i >= 0; i--) {
+                if (explosionParticles[i].update(deltaTime)) {
+                    explosionParticles[i].destroy();
+                    explosionParticles.splice(i, 1);
+                }
+            }
+
+            updateInfoDisplay();
+
+            renderer.render(scene, camera);
+        }
+
+        function updateInfoDisplay() {
+            document.getElementById('fissionCount').innerText = stats.fissionCount;
+            // The neutron count display is now handled within cleanupFrozenNeutrons() when the reaction ends.
+
+            const startButton = document.getElementById('startButton');
+
+            // Check for all stopping conditions
+            const isTimeUp = reactionStartTime !== null && (performance.now() - reactionStartTime) / 1000 >= TIME_LIMIT_SECONDS;
+            
+            // Condition for natural fizzle: Neutrons have run out AND fissions occurred
+            const reactionFizzled = stats.neutronCount === 0 && stats.fissionCount > 0;
+            
+            // Condition for hitting the engineered limit
+            const isLimitHit = stats.fissionCount >= currentFissionLimit;
+            
+            const shouldStop = reactionFizzled || isTimeUp || isLimitHit;
+
+            // Transition to the 'isReactionOver' state
+            if (shouldStop && !isReactionOver) {
+                isReactionOver = true;
+                // Immediately clean up all remaining neutrons (if any are still inside the boundary) 
+                // to reset the display counter to 0 instantly.
+                cleanupFrozenNeutrons();
+            }
+
+            if (isReactionOver) {
+                startButton.disabled = false;
+                startButton.innerText = 'Reaction Over! (Reset)';
+                
+            } else if (stats.neutronCount === 0 && stats.fissionCount === 0) {
+                // Initial state
+                startButton.disabled = false;
+                startButton.innerText = 'Start Reaction';
+            } else {
+                // Update neutron count display continuously only if reaction is running
+                document.getElementById('neutronCount').innerText = stats.neutronCount;
+            }
+            
+            // If the reaction is running, the button remains disabled and says "Reaction In Progress..."
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = function() {
+            init();
+            animate();
+        };
+
+    </script>
+</body>
+</html>
